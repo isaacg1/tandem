@@ -2,6 +2,8 @@ use noisy_float::prelude::*;
 use rand::prelude::*;
 use rand_distr::Exp;
 
+use std::collections::VecDeque;
+
 const EPSILON: f64 = 1e-8;
 const INFINITY: f64 = f64::INFINITY;
 
@@ -145,6 +147,7 @@ fn simulate(
     rho: f64,
     num_jobs: u64,
     bucket_width: f64,
+    thread_pool_limit: usize,
     seed: u64,
 ) -> Results {
     assert!((dist.mean_size() - 1.0).abs() < EPSILON);
@@ -155,6 +158,7 @@ fn simulate(
     let mut num_arrivals = 0;
     let mut time = 0.0;
     // Stored in LocalFCFS order
+    let mut admission_pool: VecDeque<Job> = VecDeque::new();
     let mut queues: Vec<Vec<Job>> = (0..num_stages).map(|_| vec![]).collect();
     let mut results = Results::new(bucket_width);
     let mut to_append = vec![];
@@ -180,6 +184,7 @@ fn simulate(
         let is_arrival = arrival_diff < next_comp_diff;
         let event_diff = arrival_diff.min(next_comp_diff);
         time += event_diff;
+        let mut num_completion_occured = 0;
         for stage in 0..num_stages {
             let queue = &mut queues[stage];
             let service = &services[stage];
@@ -195,6 +200,7 @@ fn simulate(
                     if stage == num_stages - 1 {
                         num_completions += 1;
                         results.add_response(time - job.arrival_time);
+                        num_completion_occured += 1;
                     } else {
                         let new_size = dist.sample(&mut rng);
                         let new_job = Job {
@@ -212,6 +218,11 @@ fn simulate(
             }
             assert!(to_append.is_empty());
         }
+        for _i in 0..num_completion_occured {
+            if let Some(new_job) = admission_pool.pop_front() {
+                queues[0].push(new_job);
+            }
+        }
         if is_arrival {
             let new_size = dist.sample(&mut rng);
             let new_job = Job {
@@ -220,7 +231,12 @@ fn simulate(
                 original_size: new_size,
                 id: num_arrivals,
             };
-            queues[0].push(new_job);
+            let num_jobs_in_flight: usize = queues.iter().map(|q| q.len()).sum();
+            if num_jobs_in_flight < thread_pool_limit {
+                queues[0].push(new_job);
+            } else {
+                admission_pool.push_back(new_job);
+            }
             num_arrivals += 1;
         }
     }
@@ -236,7 +252,7 @@ fn main() {
         Policy::Local_FCFS,
         Policy::PS,
     ];
-    let dist_num = 1;
+    let dist_num = 0;
     let dist = match dist_num {
         0 => Dist::Exp,
         1 => {
@@ -256,9 +272,10 @@ fn main() {
     let seed = 0;
     let bucket_width = 0.1;
     let perc = 0.99;
+    let thread_pool_limit = 100;
     println!(
-        "servers {}; stages {}; dist {:?}; jobs {}; bucket {}; seed {}",
-        num_servers_per_stage, num_stages, dist, num_jobs, bucket_width, seed
+        "servers {}; stages {}; dist {:?}; jobs {}; bucket {}; seed {}; thread_pool_limit {}",
+        num_servers_per_stage, num_stages, dist, num_jobs, bucket_width, seed, thread_pool_limit
     );
     println!("{}th percentile of response time", perc);
     print!("rho;");
@@ -277,6 +294,7 @@ fn main() {
                 rho,
                 num_jobs,
                 bucket_width,
+                thread_pool_limit,
                 seed,
             );
             print!("{};", results.percentile(perc));
